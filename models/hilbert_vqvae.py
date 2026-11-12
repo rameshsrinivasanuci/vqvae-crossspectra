@@ -182,6 +182,11 @@ class HilbertVQVAE(nn.Module):
     codebook_size    : int   — K.
     codebook_dim     : int   — D.
     decoder_hidden   : int   — decoder MLP hidden width.
+    encoder_hidden   : int or None — encoder bottleneck width. None gives a
+                       single linear proj_down (default); an int makes it a
+                       2-layer MLP (Linear -> GELU -> Linear), so the map from
+                       descriptor to codebook space is nonlinear and the
+                       quantization metric is learned.
     gamma, beta, dead_threshold : EMA quantizer hyperparameters.
     device           : torch.device or None.
     """
@@ -201,6 +206,7 @@ class HilbertVQVAE(nn.Module):
                  codebook_size=16,
                  codebook_dim=128,
                  decoder_hidden=128,
+                 encoder_hidden=None,
                  gamma=0.99,
                  beta=0.25,
                  dead_threshold=2.0,
@@ -234,7 +240,21 @@ class HilbertVQVAE(nn.Module):
         self.nonnegative    = self.encoder.nonnegative
         self.T_out          = self.encoder.T_out
 
-        self.proj_down = nn.Linear(self.descriptor_dim, codebook_dim)
+        # Encoder bottleneck: descriptor -> codebook space.
+        # encoder_hidden is None  -> single linear layer (default; codebook
+        #   geometry is a linear map of the descriptor, fully interpretable).
+        # encoder_hidden is an int -> 2-layer MLP (Linear -> GELU -> Linear),
+        #   letting the model learn a nonlinear quantization metric. Mirrors the
+        #   decoder, giving a symmetric nonlinear autoencoder of the descriptor.
+        self.encoder_hidden = encoder_hidden
+        if encoder_hidden is None:
+            self.proj_down = nn.Linear(self.descriptor_dim, codebook_dim)
+        else:
+            self.proj_down = nn.Sequential(
+                nn.Linear(self.descriptor_dim, encoder_hidden),
+                nn.GELU(),
+                nn.Linear(encoder_hidden, codebook_dim),
+            )
 
         self.quantizer = EMAVectorQuantizer(
             codebook_size=codebook_size, codebook_dim=codebook_dim,
@@ -301,6 +321,50 @@ class HilbertVQVAE(nn.Module):
                  + torch.sum(self.quantizer.codebook ** 2, dim=1))
             all_tokens.append(d.argmin(dim=-1).cpu())
         return torch.cat(all_tokens), np.array(starts)
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def tokenise_continuous(self, record, step_samples=None, device=None,
+                            batch=64):
+        """
+        Tokenise a continuous (C, T) recording at the SEGMENT scale: cut it into
+        segments of length window_samples (chunk = instance) and assign one token
+        per whole segment. This is the continuous-record counterpart of
+        tokenise_recording; here each segment is a single window, so the result
+        is one token per segment — a continuous token time series.
+
+        Parameters
+        ----------
+        record       : (C, T) array or tensor — one continuous recording.
+        step_samples : hop between segments; None -> non-overlapping
+                       (step == window_samples).
+        Returns
+        -------
+        tokens  : (N_seg,) LongTensor — one token id per segment.
+        starts  : (N_seg,) np.int64   — segment start sample (timing map).
+        """
+        device = device or self.device
+        self.eval()
+        if not isinstance(record, torch.Tensor):
+            record = torch.from_numpy(np.asarray(record)).float()
+        record = record.to(device)
+
+        ws   = self.window_samples
+        step = int(ws if step_samples is None else step_samples)
+        C, T = record.shape
+        starts = list(range(0, T - ws + 1, step))
+        segments = torch.stack([record[:, s:s + ws] for s in starts]) \
+                   if starts else torch.empty((0, C, ws), device=device)
+
+        all_tokens = []
+        for i in range(0, len(segments), batch):
+            z_e, _, _, _ = self.encode(segments[i:i + batch])
+            d = (torch.sum(z_e ** 2, dim=1, keepdim=True)
+                 - 2 * z_e @ self.quantizer.codebook.t()
+                 + torch.sum(self.quantizer.codebook ** 2, dim=1))
+            all_tokens.append(d.argmin(dim=-1).cpu())
+        tokens = torch.cat(all_tokens) if all_tokens else torch.empty(0, dtype=torch.long)
+        return tokens, np.asarray(starts, dtype=np.int64)
 
     # ------------------------------------------------------------------
     @torch.no_grad()
